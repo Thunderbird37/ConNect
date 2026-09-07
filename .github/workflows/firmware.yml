@@ -62,10 +62,18 @@ jobs:
         run: |
           set -euo pipefail
           build_dir=".pio/build/esp32-s3"
-          version="${GITHUB_REF_NAME}"
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid release tag: ${version}" >&2
-            exit 1
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+            if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Invalid release tag: ${version}" >&2
+              exit 1
+            fi
+          else
+            # GITHUB_REF_NAME is e.g. "123/merge" for pull requests. Using it
+            # in an asset filename creates an unintended subdirectory and made
+            # the staging step fail. A short commit ID is filesystem-safe and
+            # also identifies non-release artifacts unambiguously.
+            version="ci-${GITHUB_SHA:0:7}"
           fi
           mkdir -p dist
 
