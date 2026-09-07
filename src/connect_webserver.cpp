@@ -2,6 +2,7 @@
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
 #include "connect_webserver.h"
+#include "config_validation.h"
 #include "ota_config.h"
 #include "usb_host_bridge.h"
 
@@ -776,18 +777,24 @@ void ConNectWebServer::handleSave() {
     bool restartRequired = false;
     String savedWiFiMode = getConfiguredWiFiModeValue();
 
-    if (_server->hasArg("wifiMode")) {
-        String requestedMode = _server->arg("wifiMode");
-        if (requestedMode != "AP" && requestedMode != "CLIENT") {
+    if (_server->hasArg("wifiMode") || _server->hasArg("wifiSSID") ||
+        _server->hasArg("otaSSID") || _server->hasArg("wifiPassword") ||
+        _server->hasArg("otaPassword")) {
+        String requestedMode = _server->hasArg("wifiMode")
+                                 ? _server->arg("wifiMode")
+                                 : savedWiFiMode;
+        if (!config::isValidWiFiMode(requestedMode.c_str())) {
             _server->send(400, "application/json", "{\"success\":false,\"error\":\"Ungültiger WLAN-Modus\"}");
             return;
         }
 
         String requestedSSID = _server->hasArg("wifiSSID")
                                  ? _server->arg("wifiSSID")
-                                 : prefs.getString("otaSSID", "");
+                                 : (_server->hasArg("otaSSID")
+                                      ? _server->arg("otaSSID")
+                                      : prefs.getString("otaSSID", ""));
         requestedSSID.trim();
-        if (requestedSSID.length() > 32) {
+        if (!config::isValidSsidLength(requestedSSID.length())) {
             _server->send(400, "application/json", "{\"success\":false,\"error\":\"SSID darf höchstens 32 Bytes haben\"}");
             return;
         }
@@ -796,36 +803,40 @@ void ConNectWebServer::handleSave() {
             return;
         }
 
-        if (_server->hasArg("wifiPassword") && !_server->hasArg("clearWifiPassword")) {
-            String password = _server->arg("wifiPassword");
-            if (password.length() > 0 && (password.length() < 8 || password.length() > 64)) {
+        if ((_server->hasArg("wifiPassword") || _server->hasArg("otaPassword")) &&
+            !_server->hasArg("clearWifiPassword")) {
+            String password = _server->hasArg("wifiPassword")
+                                ? _server->arg("wifiPassword")
+                                : _server->arg("otaPassword");
+            if (!config::isValidWiFiPasswordLength(password.length())) {
                 _server->send(400, "application/json", "{\"success\":false,\"error\":\"Passwort muss 8 bis 64 Zeichen haben\"}");
                 return;
             }
         }
     }
     if (_server->hasArg("baudRate")) {
-        uint32_t newBaud = _server->arg("baudRate").toInt();
-        // Validate baud rate
-        const uint32_t validBauds[] = {300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
-        bool valid = false;
-        for (uint32_t b : validBauds) {
-            if (newBaud == b) { valid = true; break; }
+        String baudValue = _server->arg("baudRate");
+        uint32_t newBaud = baudValue.toInt();
+        if (!config::isValidBaudRate(newBaud) || baudValue != String(newBaud)) {
+            _server->send(400, "application/json", "{\"success\":false,\"error\":\"Ungültige Baudrate\"}");
+            return;
         }
-        if (valid) {
-            currentBaudRate = newBaud;
-            // Apply to RS232
-            extern HardwareSerial RS232Serial;
-            RS232Serial.updateBaudRate(currentBaudRate);
-            // Apply to USB if connected
-            if (usbHostConnected()) {
-                usbHostSetLineCoding(currentBaudRate);
-            }
+        currentBaudRate = newBaud;
+        // Apply to RS232
+        extern HardwareSerial RS232Serial;
+        RS232Serial.updateBaudRate(currentBaudRate);
+        // Apply to USB if connected
+        if (usbHostConnected()) {
+            usbHostSetLineCoding(currentBaudRate);
         }
     }
     
     if (_server->hasArg("mode")) {
         String mode = _server->arg("mode");
+        if (!config::isValidSerialMode(mode.c_str())) {
+            _server->send(400, "application/json", "{\"success\":false,\"error\":\"Ungültiger serieller Modus\"}");
+            return;
+        }
         if (mode == "USB") {
             if (!usbHostInitialized()) restartRequired = true;
             setSerialTargetMode(true);

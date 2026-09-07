@@ -1,4 +1,5 @@
 #include "terminal_transport.h"
+#include "config_validation.h"
 
 #include <array>
 #include <cassert>
@@ -109,6 +110,29 @@ static void testTerminalKeysRemainByteExact() {
     assert(output == input);
 }
 
+static void testConfigurationValidation() {
+    assert(config::isValidBaudRate(300));
+    assert(config::isValidBaudRate(921600));
+    assert(!config::isValidBaudRate(0));
+    assert(!config::isValidBaudRate(115201));
+
+    assert(config::isValidSerialMode("USB"));
+    assert(config::isValidSerialMode("RS232"));
+    assert(!config::isValidSerialMode("usb"));
+    assert(config::isValidWiFiMode("AP"));
+    assert(config::isValidWiFiMode("CLIENT"));
+    assert(!config::isValidWiFiMode("STA"));
+
+    assert(config::isValidSsidLength(0));
+    assert(config::isValidSsidLength(32));
+    assert(!config::isValidSsidLength(33));
+    assert(config::isValidWiFiPasswordLength(0));
+    assert(config::isValidWiFiPasswordLength(8));
+    assert(config::isValidWiFiPasswordLength(64));
+    assert(!config::isValidWiFiPasswordLength(7));
+    assert(!config::isValidWiFiPasswordLength(65));
+}
+
 int main() {
     testRingWraparound();
     testRingRejectsAtomically();
@@ -116,5 +140,6 @@ int main() {
     testTelnetEncoding();
     testNewlinesAndControlSequences();
     testTerminalKeysRemainByteExact();
+    testConfigurationValidation();
     return 0;
 }
