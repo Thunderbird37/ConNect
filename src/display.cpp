@@ -310,6 +310,9 @@ void Display::clear() { if (displayFound) u8g2.clearBuffer(); }
 
 void Display::refresh() { if (displayFound) u8g2.sendBuffer(); }
 
+// OLED-Controller in den Stromsparmodus; u8g2.begin() weckt ihn beim Boot.
+void Display::sleep() { if (displayFound) u8g2.setPowerSave(1); }
+
 void Display::showMessage(const char* line1, const char* line2, const char* line3) {
 	// Ohne Lock-Zeit: Standard-Verhalten
 	showMessage(line1, line2, line3, 0);

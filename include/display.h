@@ -21,6 +21,7 @@ public:
     void showMessage(const char* line1, const char* line2 = nullptr, const char* line3 = nullptr);
     void clear();
     void refresh();
+    void sleep();
     bool isConnected() const { return displayFound; }
     
     // Screensaver

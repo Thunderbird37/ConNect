@@ -1,6 +1,7 @@
 #include <WebServer.h>
 #include "esp_task_wdt.h"
 #include "esp_heap_caps.h"
+#include "baud_config.h"
 #include "connect_webserver.h"
 #include "config_validation.h"
 #include "ota_config.h"
@@ -20,15 +21,6 @@
 ConNectWebServer webServer;
 extern void setSerialTargetMode(bool usbMode);
 extern void rs232ReinitUart();
-
-static String getConfiguredOTAManifestUrl() {
-    String url = prefs.getString("otaUrl", OTAConfig::DEFAULT_MANIFEST_URL);
-    url.trim();
-    if (url.length() == 0) {
-        return OTAConfig::DEFAULT_MANIFEST_URL;
-    }
-    return url;
-}
 
 // Feste Byte-Ringpuffer-Implementierung (kein Arduino String!):
 // Arduino String += c reallokiert bei jedem Byte -> O(n^2) und starke
@@ -695,6 +687,7 @@ String ConNectWebServer::getStatusJSON() {
     static char buf[1024];
     String wifiIp = jsonEscape(getWiFiIpAddress());
     String wifiHostname = jsonEscape(getWiFiHostname());
+    String firmwareVersion = jsonEscape(getFirmwareVersion());
     uint32_t internalHeapFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     uint32_t internalHeapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     snprintf(buf, sizeof(buf),
@@ -717,7 +710,7 @@ String ConNectWebServer::getStatusJSON() {
         "\"usb_drop\":%lu,\"usb_rx_queue\":%u,"
         "\"rs232_rx\":%lu,\"rs232_tx\":%lu,"
         "\"heap_internal_free\":%lu,\"heap_internal_largest\":%lu},"
-        "\"version\":\"" GIT_VERSION "\","
+        "\"version\":\"%s\","
         "\"commit\":\"" GIT_COMMIT "\","
         "\"buildTime\":\"" BUILD_TIME "\"}",
         isUSBMode ? "USB" : "RS232",
@@ -737,7 +730,8 @@ String ConNectWebServer::getStatusJSON() {
         (unsigned long)stat_usb_rx.load(),   (unsigned long)stat_usb_tx.load(),
         (unsigned long)usbHostDroppedBytes(), (unsigned)usbHostRxQueueCapacity(),
         (unsigned long)stat_rs232_rx.load(), (unsigned long)stat_rs232_tx.load(),
-        (unsigned long)internalHeapFree, (unsigned long)internalHeapLargest
+        (unsigned long)internalHeapFree, (unsigned long)internalHeapLargest,
+        firmwareVersion.c_str()
     );
     return String(buf);
 }
@@ -776,67 +770,69 @@ void ConNectWebServer::handleSave() {
     if (!checkAuth()) return;
     bool restartRequired = false;
     String savedWiFiMode = getConfiguredWiFiModeValue();
+    auto sendError = [this](const char* message) {
+        _server->send(400, "application/json",
+                      String("{\"success\":false,\"error\":\"") + message + "\"}");
+    };
 
-    if (_server->hasArg("wifiMode") || _server->hasArg("wifiSSID") ||
-        _server->hasArg("otaSSID") || _server->hasArg("wifiPassword") ||
-        _server->hasArg("otaPassword")) {
-        String requestedMode = _server->hasArg("wifiMode")
-                                 ? _server->arg("wifiMode")
-                                 : savedWiFiMode;
+    // Erst alle Eingaben pruefen, dann speichern: ein ungueltiges Feld darf
+    // keine halb uebernommene Konfiguration hinterlassen.
+    const bool hasWiFiArgs = _server->hasArg("wifiMode") || _server->hasArg("wifiSSID") ||
+                             _server->hasArg("otaSSID") || _server->hasArg("wifiPassword") ||
+                             _server->hasArg("otaPassword");
+    if (hasWiFiArgs) {
+        String requestedMode = _server->hasArg("wifiMode") ? _server->arg("wifiMode") : savedWiFiMode;
         if (!config::isValidWiFiMode(requestedMode.c_str())) {
-            _server->send(400, "application/json", "{\"success\":false,\"error\":\"Ungültiger WLAN-Modus\"}");
+            sendError("Ungültiger WLAN-Modus");
             return;
         }
 
-        String requestedSSID = _server->hasArg("wifiSSID")
-                                 ? _server->arg("wifiSSID")
-                                 : (_server->hasArg("otaSSID")
-                                      ? _server->arg("otaSSID")
-                                      : prefs.getString("otaSSID", ""));
+        String requestedSSID = _server->hasArg("wifiSSID") ? _server->arg("wifiSSID")
+                             : _server->hasArg("otaSSID")  ? _server->arg("otaSSID")
+                                                            : prefs.getString("otaSSID", "");
         requestedSSID.trim();
         if (!config::isValidSsidLength(requestedSSID.length())) {
-            _server->send(400, "application/json", "{\"success\":false,\"error\":\"SSID darf höchstens 32 Bytes haben\"}");
+            sendError("SSID darf höchstens 32 Bytes haben");
             return;
         }
         if (requestedMode == "CLIENT" && requestedSSID.length() == 0) {
-            _server->send(400, "application/json", "{\"success\":false,\"error\":\"Für den WLAN-Client wird eine SSID benötigt\"}");
+            sendError("Für den WLAN-Client wird eine SSID benötigt");
             return;
         }
 
         if ((_server->hasArg("wifiPassword") || _server->hasArg("otaPassword")) &&
             !_server->hasArg("clearWifiPassword")) {
-            String password = _server->hasArg("wifiPassword")
-                                ? _server->arg("wifiPassword")
-                                : _server->arg("otaPassword");
+            String password = _server->hasArg("wifiPassword") ? _server->arg("wifiPassword")
+                                                              : _server->arg("otaPassword");
             if (!config::isValidWiFiPasswordLength(password.length())) {
-                _server->send(400, "application/json", "{\"success\":false,\"error\":\"Passwort muss 8 bis 64 Zeichen haben\"}");
+                sendError("Passwort muss 8 bis 64 Zeichen haben");
                 return;
             }
         }
     }
+
+    uint32_t newBaud = currentBaudRate;
     if (_server->hasArg("baudRate")) {
         String baudValue = _server->arg("baudRate");
-        uint32_t newBaud = baudValue.toInt();
-        if (!config::isValidBaudRate(newBaud) || baudValue != String(newBaud)) {
-            _server->send(400, "application/json", "{\"success\":false,\"error\":\"Ungültige Baudrate\"}");
+        uint32_t requestedBaud = baudValue.toInt();
+        if (!config::isValidBaudRate(requestedBaud) || baudValue != String(requestedBaud)) {
+            sendError("Ungültige Baudrate");
             return;
         }
-        currentBaudRate = newBaud;
-        // Apply to RS232
-        extern HardwareSerial RS232Serial;
-        RS232Serial.updateBaudRate(currentBaudRate);
-        // Apply to USB if connected
-        if (usbHostConnected()) {
-            usbHostSetLineCoding(currentBaudRate);
-        }
+        newBaud = requestedBaud;
     }
-    
+
+    String mode = _server->hasArg("mode") ? _server->arg("mode") : String();
+    if (_server->hasArg("mode") && !config::isValidSerialMode(mode.c_str())) {
+        sendError("Ungültiger serieller Modus");
+        return;
+    }
+
+    if (newBaud != currentBaudRate) {
+        applyTargetBaudRate(newBaud);
+    }
+
     if (_server->hasArg("mode")) {
-        String mode = _server->arg("mode");
-        if (!config::isValidSerialMode(mode.c_str())) {
-            _server->send(400, "application/json", "{\"success\":false,\"error\":\"Ungültiger serieller Modus\"}");
-            return;
-        }
         if (mode == "USB") {
             if (!usbHostInitialized()) restartRequired = true;
             setSerialTargetMode(true);
@@ -961,8 +957,10 @@ void ConNectWebServer::handleTerminalSend() {
 
 void ConNectWebServer::handleTerminalClear() {
     if (!checkAuth()) return;
-    terminalRxLen  = 0;
-    terminalRxBase = 0;
+    // Basis-Offset bleibt monoton, damit andere offene Tabs ihre Leseposition
+    // behalten und keine neuen Daten verpassen.
+    terminalRxBase += terminalRxLen;
+    terminalRxLen   = 0;
     _server->send(200, "application/json", "{\"success\":true}");
 }
 
@@ -1114,8 +1112,7 @@ void ConNectWebServer::streamHTML() {
                     <label>Baudrate</label>
                     <select name="baudRate" id="baudSelect">)rawliteral";
     
-    const uint32_t bauds[] = {300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
-    for (uint32_t b : bauds) {
+    for (uint32_t b : BaudConfig::ALL_RATES) {
         html += "<option value=\"" + String(b) + "\"";
         if (b == currentBaudRate) html += " selected";
         html += ">" + String(b) + "</option>";
@@ -1266,7 +1263,9 @@ void ConNectWebServer::streamHTML() {
     )rawliteral";
     
     // Version Footer
-    html += "<div class=\"version\">Version: " GIT_VERSION " (" GIT_COMMIT ")<br>Build: " BUILD_TIME "</div>";
+    html += "<div class=\"version\">Version: ";
+    html += htmlAttrEscape(getFirmwareVersion());
+    html += " (" GIT_COMMIT ")<br>Build: " BUILD_TIME "</div>";
     
     html.appendProgmem(HTML_FOOTER, sizeof(HTML_FOOTER) - 1);
     html.finish();

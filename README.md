@@ -154,6 +154,19 @@ Measure before attaching external power:
 
 These tests apply to other ESP32-S3 projects with the same cold-start symptom.
 
+#### Firmware Behavior With an Empty Battery
+
+When the battery stays critical for two minutes, the firmware turns off WiFi,
+BLE, the display, and the LED, then enters deep sleep. Every 60 seconds it only
+measures the battery voltage and goes straight back to sleep. A full start
+happens when the resting voltage reaches 3.45 V, the voltage rises during
+charging, or the BOOT button is pressed. `` `power `` shows how often the
+critical sleep was entered.
+
+Deep sleep does not disconnect always-on board loads such as the regulator, LEDs,
+or the battery divider. For storage, use a power switch that disconnects the
+battery completely.
+
 ## 🚀 Getting Started
 
 ### Prerequisites
@@ -216,6 +229,20 @@ The selected mode and credentials are stored in NVS and restored at boot. If
 client startup fails or no credentials exist, ConNect opens its `ConNect`
 hotspot at `192.168.32.1` as a recovery fallback. mDNS is intentionally enabled
 only in client mode, so the stable SoftAP boot path remains unchanged.
+
+The ESP32-S3 supports only 2.4 GHz (802.11b/g/n). On tri-band, WiFi 6E/7, or
+mesh routers, the SSID must also be broadcast on 2.4 GHz. ConNect scans all
+channels, picks the strongest access point, and supports WPA2, WPA3, and
+WPA2/WPA3 transition mode, including WPA3 Hash-to-Element (H2E).
+
+If the connection fails, the display shows the reason before the fallback
+hotspot starts. `` `status `` reports the last WLAN error code, `` `wlanlog ``
+shows the timeline of the last connection attempt (association, IP, disconnect
+reasons), and `` `wlanscan `` lists the 2.4 GHz networks in range with channel,
+signal, and security. A failed attempt that never reached the router shows no
+error code; the log then tells whether the device associated without receiving
+an IP address. If the configured SSID is missing from the scan, enable the 2.4 GHz
+band on the router. Avoid MLO-only or WPA3-only 6 GHz SSIDs for ConNect.
 
 ### Bluetooth Low Energy
 
@@ -282,6 +309,9 @@ Send commands via Telnet or BLE (prefix with `` ` `` or `'`):
 | `` `status `` | Show system status |
 | `` `version `` | Show firmware version |
 | `` `wlan SSID PASSWORD `` | Store WLAN credentials |
+| `` `wlanscan `` | List 2.4 GHz networks in range |
+| `` `wlanlog `` | Show the last WLAN connection attempt |
+| `` `power `` | Boot, reset, and battery diagnostics |
 | `` `ota `` | Start OTA update |
 | `` `help `` | Show all commands |
 
@@ -378,7 +408,9 @@ Expected manifest example:
 ```
 
 GitHub Actions calculates the checksum automatically. The device rejects a
-download whose MD5 does not match the manifest.
+download whose MD5 does not match the manifest. Tagged builds only install a
+newer manifest version; equal or older versions are reported as up to date or
+older on the display. Dirty and untagged development builds always update.
 
 ### Method 2: Local OTA (Development)
 
@@ -401,17 +433,23 @@ For the migration, keep the previous OTA service available for one bridge
 release or redirect its manifest request to the latest GitHub manifest. On first
 boot, that firmware stores GitHub Releases as its OTA source.
 
-### Terminal Transport Test
+### Host Tests
 
 ```bash
-c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
-  test/terminal_transport_test.cpp -o /tmp/connect-terminal-test
-/tmp/connect-terminal-test
+for test_name in terminal_transport ota_manifest; do
+  c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+    "test/${test_name}_test.cpp" -o "/tmp/connect-${test_name}-test"
+  "/tmp/connect-${test_name}-test"
+done
 ```
 
-The test covers ring-buffer wraparound and atomic overflow rejection, Telnet IAC
-negotiation, CR/LF handling, cursor keys, Home/End, Page Up/Down, Insert/Delete,
-F1, Tab, Ctrl+C, Backspace, and DEL.
+`terminal_transport_test` covers ring-buffer wraparound and atomic overflow
+rejection, Telnet IAC negotiation, CR/LF handling, cursor keys, Home/End,
+Page Up/Down, Insert/Delete, F1, Tab, Ctrl+C, Backspace, DEL, and web
+configuration input validation.
+
+`ota_manifest_test` covers manifest JSON parsing, MD5 validation, relative
+firmware URLs, and the OTA version comparison.
 
 ## 🐛 Troubleshooting
 
@@ -422,6 +460,7 @@ F1, Tab, Ctrl+C, Backspace, and DEL.
 | USB device not detected | Ensure device is CDC-compatible (FTDI/CP210x/CH34x) |
 | BLE not visible | Press button 1-5s to enable advertising |
 | OTA fails | Check WiFi credentials, OTA URL and uploaded manifest/files |
+| WLAN client does not connect | Check the error code with `` `status ``, verify the SSID is on 2.4 GHz with `` `wlanscan `` |
 
 ### Loopback Test
 
@@ -450,7 +489,11 @@ ConNect/
 │   ├── buzzer.cpp/h          # Audio feedback
 │   ├── usb_host_bridge.cpp/h # USB Host CDC
 │   ├── connect_webserver.cpp/h # Web interface
-│   └── ota_config.h          # OTA release endpoint
+│   ├── ota_config.h          # OTA release endpoint
+│   ├── ota_manifest.h        # OTA manifest parsing and version comparison
+│   ├── baud_config.h         # Baud rate presets
+│   ├── config_validation.h   # Web configuration input validation
+│   └── terminal_transport.h  # Telnet and ring-buffer primitives
 ├── lib/
 │   ├── usb_host_cdc_acm/     # USB CDC driver
 │   ├── usb_host_ftdi_vcp/    # FTDI support

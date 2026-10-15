@@ -48,11 +48,13 @@ jobs:
       - name: Install PlatformIO
         run: python -m pip install --disable-pip-version-check "platformio==6.1.18"
 
-      - name: Test terminal transport
+      - name: Run host tests
         run: |
-          c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
-            test/terminal_transport_test.cpp -o /tmp/connect-terminal-test
-          /tmp/connect-terminal-test
+          for test_name in terminal_transport ota_manifest; do
+            c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+              "test/${test_name}_test.cpp" -o "/tmp/connect-${test_name}-test"
+            "/tmp/connect-${test_name}-test"
+          done
 
       - name: Build firmware
         run: pio run -e esp32-s3

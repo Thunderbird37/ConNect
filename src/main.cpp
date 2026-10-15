@@ -12,6 +12,7 @@
 #include <ESPmDNS.h>
 #include <cerrno>
 #include <sys/socket.h>
+#include <cstdarg>
 #include <string>
 
 #include "freertos/FreeRTOS.h"
@@ -28,11 +29,16 @@ extern "C" {
 #include "esp_heap_caps.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_wifi.h"
 }
 #include "display.h"
 #include "buzzer.h"
+#include "baud_config.h"
 #include "connect_webserver.h"
 #include "ota_config.h"
+#include "ota_manifest.h"
 
 #include "terminal_transport.h"
 #include "usb_host_bridge.h"
@@ -58,8 +64,13 @@ namespace WiFiConfig {
   };
 
   constexpr const char* MDNS_HOSTNAME = "connect";
-  constexpr unsigned long CLIENT_CONNECT_TIMEOUT_MS = 15000;
+  constexpr unsigned long CLIENT_CONNECT_TIMEOUT_MS = 20000;
 }
+
+// Letzter WLAN-Trennungsgrund (wifi_err_reason_t), wird im Arduino-Event-Task
+// geschrieben und in Status/Display angezeigt.
+static std::atomic<uint8_t> wifiLastDisconnectReason{0};
+static std::atomic<uint32_t> wifiDisconnectCount{0};
 
 // -----------------------------------------------------------------------------
 // Timing-Konstanten (eliminiert Magic Numbers)
@@ -98,21 +109,6 @@ namespace Timing {
   constexpr size_t        TARGET_CONTROL_RESERVE = 512;
 }
 
-// -----------------------------------------------------------------------------
-// Baudrate-Konfiguration (zentrale Definition)
-// -----------------------------------------------------------------------------
-namespace BaudConfig {
-  // Alle gültigen Baudraten
-  constexpr uint32_t ALL_RATES[] = {300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
-  constexpr int ALL_RATES_COUNT = sizeof(ALL_RATES) / sizeof(ALL_RATES[0]);
-  
-  // Rotation für Doppelklick (häufig verwendete)
-  constexpr uint32_t CYCLE_RATES[] = {9600, 19200, 38400, 57600, 115200, 230400};
-  constexpr int CYCLE_RATES_COUNT = sizeof(CYCLE_RATES) / sizeof(CYCLE_RATES[0]);
-  
-  constexpr uint32_t DEFAULT_BAUD = 115200;
-}
-
 namespace SerialBufferConfig {
   constexpr size_t RS232_RX_BYTES = 8192;
 }
@@ -123,7 +119,21 @@ namespace PowerConfig {
   constexpr uint32_t CRITICAL_SLEEP_GRACE_MS = 120000;
   constexpr uint32_t CRITICAL_SLEEP_MIN_UPTIME_MS = 120000;
   constexpr uint64_t CRITICAL_SLEEP_US = 60ULL * 1000000ULL;
+  // Ruhespannung, ab der nach einem kritischen Sleep wieder voll gestartet
+  // wird. Liegt deutlich ueber CRITICAL_SLEEP_VOLTAGE, weil sich ein leerer
+  // Akku ohne Last um einige 100 mV erholt; beim Laden wird sie sofort erreicht.
+  constexpr float CRITICAL_RESUME_VOLTAGE = 3.45f;
+  // Laden erkennen, bevor die Ruhespannung erreicht ist: Anstieg pro Check.
+  // Die ersten Checks werden ignoriert, weil sich der Akku nach Lastende
+  // ohnehin erholt (Relaxation).
+  constexpr float CRITICAL_CHARGE_RISE_V = 0.06f;
+  constexpr uint32_t CRITICAL_RELAXATION_CHECKS = 5;
 }
+
+// Ueberlebt Deep Sleep, wird aber bei echtem Stromverlust geloescht.
+RTC_DATA_ATTR static bool rtcCriticalSleepActive = false;
+RTC_DATA_ATTR static uint32_t rtcCriticalSleepChecks = 0;
+RTC_DATA_ATTR static float rtcCriticalLastVoltage = 0.0f;
 
 namespace BatteryConfig {
   constexpr float VALID_MIN_VOLTAGE = 2.70f;
@@ -331,7 +341,7 @@ static const char* wakeCauseToStr(esp_sleep_wakeup_cause_t cause) {
   }
 }
 
-static String getConfiguredOTAManifestUrl() {
+String getConfiguredOTAManifestUrl() {
   String url = prefs.getString("otaUrl", OTAConfig::DEFAULT_MANIFEST_URL);
   url.trim();
   if (url.length() == 0) {
@@ -340,87 +350,44 @@ static String getConfiguredOTAManifestUrl() {
   return url;
 }
 
-static String extractJsonStringField(const String& payload, const char* field, int searchFrom = 0) {
-  String needle = String("\"") + field + "\"";
-  int fieldIdx = payload.indexOf(needle, searchFrom);
-  if (fieldIdx < 0) {
-    return "";
-  }
-
-  int colonIdx = payload.indexOf(':', fieldIdx + needle.length());
-  if (colonIdx < 0) {
-    return "";
-  }
-
-  int valueStart = payload.indexOf('"', colonIdx + 1);
-  if (valueStart < 0) {
-    return "";
-  }
-
-  valueStart += 1;
-  int valueEnd = valueStart;
-  bool escaped = false;
-  while (valueEnd < payload.length()) {
-    char current = payload[valueEnd];
-    if (current == '"' && !escaped) {
-      break;
-    }
-    if (current == '\\' && !escaped) {
-      escaped = true;
-    } else {
-      escaped = false;
-    }
-    valueEnd++;
-  }
-
-  if (valueEnd <= valueStart || valueEnd >= payload.length()) {
-    return "";
-  }
-
-  return payload.substring(valueStart, valueEnd);
+static String toArduinoString(const std::string& value) {
+  return String(value.c_str());
 }
 
-static bool isValidMD5(const String& value) {
-  if (value.length() != 32) {
-    return false;
-  }
-  for (size_t i = 0; i < value.length(); ++i) {
-    char c = value[i];
-    bool isHex = (c >= '0' && c <= '9') ||
-                 (c >= 'a' && c <= 'f') ||
-                 (c >= 'A' && c <= 'F');
-    if (!isHex) {
-      return false;
-    }
-  }
-  return true;
+static std::string toStdString(const String& value) {
+  return std::string(value.c_str(), value.length());
 }
 
-static String buildAbsoluteUrl(const String& sourceUrl, const String& location) {
-  if (location.length() == 0) {
-    return "";
+// Kurzform der ELF-SHA256 eines App-Images. Bindet die in NVS gespeicherte
+// OTA-Version an genau das Image, das sie installiert hat.
+static String appElfShaPrefix(const esp_app_desc_t& desc) {
+  char hex[17];
+  for (size_t i = 0; i < 8; ++i) {
+    snprintf(hex + i * 2, 3, "%02x", desc.app_elf_sha256[i]);
   }
+  return String(hex);
+}
 
-  if (location.startsWith("http://") || location.startsWith("https://")) {
-    return location;
+static String installedOtaVersion;
+
+// Eine per OTA gespeicherte Tag-Version gilt nur, solange genau dieses Image
+// laeuft. Nach USB-/espota-Flash wird sie verworfen, sonst waeren Anzeige und
+// Versionsvergleich veraltet.
+static void loadInstalledOtaVersion() {
+  String storedVersion = prefs.getString("otaVersion", "");
+  if (storedVersion.length() == 0) return;
+  String storedElf = prefs.getString("otaElf", "");
+  const esp_app_desc_t* running = esp_app_get_description();
+  if (running && storedElf.length() > 0 && storedElf == appElfShaPrefix(*running)) {
+    installedOtaVersion = storedVersion;
+    return;
   }
+  prefs.remove("otaVersion");
+  prefs.remove("otaElf");
+}
 
-  int schemeIdx = sourceUrl.indexOf("://");
-  if (schemeIdx < 0) {
-    return location;
-  }
-
-  int hostStart = schemeIdx + 3;
-  int hostEnd = sourceUrl.indexOf('/', hostStart);
-  String origin = hostEnd >= 0 ? sourceUrl.substring(0, hostEnd) : sourceUrl;
-
-  if (location.startsWith("/")) {
-    return origin + location;
-  }
-
-  int lastSlash = sourceUrl.lastIndexOf('/');
-  String baseDir = lastSlash >= 0 ? sourceUrl.substring(0, lastSlash + 1) : sourceUrl + "/";
-  return baseDir + location;
+String getFirmwareVersion() {
+  return installedOtaVersion.length() > 0 ? installedOtaVersion : String(FIRMWARE_VERSION);
 }
 
 // -----------------------------------------------------------------------------
@@ -611,13 +578,6 @@ bool isBatteryCharging() {
   return chargingState;
 }
 
-static inline bool isValidBaud(uint32_t baud) {
-  for (int i = 0; i < BaudConfig::ALL_RATES_COUNT; i++) {
-    if (BaudConfig::ALL_RATES[i] == baud) return true;
-  }
-  return false;
-}
-
 void rs232ReinitUart() {
   RS232Serial.setRxBufferSize(SerialBufferConfig::RS232_RX_BYTES);
   RS232Serial.begin(currentBaudRate, SERIAL_8N1, UART_RX, UART_TX);
@@ -640,6 +600,21 @@ void rs232ReinitUart() {
   RS232Serial.setRxFIFOFull(64);
 }
 
+// Zentraler Pfad fuer alle Baudraten-Aenderungen (Taste, Befehle, Web-UI):
+// wendet die Rate auf RS232 und USB-Host an und speichert sie in NVS. Der
+// USB-Host merkt sich die Rate auch ohne verbundenes Geraet fuer den naechsten
+// Connect.
+bool applyTargetBaudRate(uint32_t baud) {
+  if (!BaudConfig::isValid(baud)) return false;
+  currentBaudRate = baud;
+  if (isUSBMode) RS232Serial.updateBaudRate(baud);
+  else           rs232ReinitUart();
+  usbHostSetLineCoding(baud);
+  usbHostSetSignals(true, true);
+  prefs.putUInt("baudRate", baud);
+  return true;
+}
+
 static void cycleBaudRate() {
   // Finde aktuelle Position und gehe zur nächsten
   int idx = 0;
@@ -647,22 +622,7 @@ static void cycleBaudRate() {
     if (BaudConfig::CYCLE_RATES[i] == currentBaudRate) { idx = i; break; }
   }
   idx = (idx + 1) % BaudConfig::CYCLE_RATES_COUNT;
-  currentBaudRate = BaudConfig::CYCLE_RATES[idx];
-  if (isUSBMode) RS232Serial.updateBaudRate(currentBaudRate);
-  else           rs232ReinitUart();
-  usbHostSetLineCoding(currentBaudRate);
-  usbHostSetSignals(true, true);
-  // Speichern in NVS
-  prefs.putUInt("baudRate", currentBaudRate);
-}
-
-static inline void setBaudRate(uint32_t baud) {
-  if (!isValidBaud(baud)) return;
-  currentBaudRate = baud;
-  if (isUSBMode) RS232Serial.updateBaudRate(baud);
-  else           rs232ReinitUart();
-  usbHostSetLineCoding(baud);
-  usbHostSetSignals(true, true);
+  applyTargetBaudRate(BaudConfig::CYCLE_RATES[idx]);
 }
 
 // -----------------------------------------------------------------------------
@@ -982,6 +942,15 @@ static inline void rgbUpdate(){
   rgbShow(r,g,b);
 }
 
+// Timer-Wake fuer die Akkukontrolle, BOOT-Taste (GPIO0, extern hochgezogen)
+// fuer einen manuellen Start.
+[[noreturn]] static void startCriticalDeepSleep() {
+  esp_sleep_enable_timer_wakeup(PowerConfig::CRITICAL_SLEEP_US);
+  esp_sleep_enable_ext0_wakeup(static_cast<gpio_num_t>(MODE_BUTTON_PIN), 0);
+  esp_deep_sleep_start();
+  while (true) {}
+}
+
 static void enterCriticalBatterySleep() {
   String msg = "Akku kritisch - Sleep\r\n";
   webConsolePushRxBulk(msg.c_str(), msg.length());
@@ -991,7 +960,7 @@ static void enterCriticalBatterySleep() {
   }
   if (bleNotificationsEnabled.load() && pTxCharacteristic) bleNotifyLine("Akku kritisch - Sleep");
 
-  display.showMessage("Akku leer", "Sleep", "Laden", 1000);
+  display.showMessage("Akku leer", "Laden oder", "Taste = Start", 1000);
   delay(300);
 
   if (telnetSessionActive) closeTelnetSession();
@@ -1011,11 +980,45 @@ static void enterCriticalBatterySleep() {
   rgbShow(0, 0, 0);
   display.clear();
   display.refresh();
+  display.sleep();
 
-  esp_sleep_enable_timer_wakeup(PowerConfig::CRITICAL_SLEEP_US);
+  prefs.putUInt("critSleeps", prefs.getUInt("critSleeps", 0) + 1);
+  prefs.putFloat("critSleepV", batteryVoltageFiltered);
+  rtcCriticalSleepActive = true;
+  rtcCriticalSleepChecks = 0;
+  rtcCriticalLastVoltage = 0.0f;
+
   delay(50);
-  esp_deep_sleep_start();
-  while (true) delay(1000);
+  startCriticalDeepSleep();
+}
+
+// Laeuft als Erstes in setup(): Nach einem Timer-Wake aus dem kritischen
+// Sleep wird nur kurz die Akkuspannung gemessen. Ist der Akku weiterhin leer,
+// geht das Geraet sofort wieder schlafen, ohne Display, BLE, WLAN oder NVS-
+// Schreibzugriffe. Vorher lief jeder Wake mehrere Minuten mit allen Funkmodulen
+// und hat den Akku bis in die Abschaltung der Schutzschaltung entladen.
+static void resumeCriticalSleepIfBatteryEmpty() {
+  if (!rtcCriticalSleepActive) return;
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+    rtcCriticalSleepActive = false;
+    return;
+  }
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
+  float voltage = readBatteryVoltageRaw();
+  bool charging = rtcCriticalSleepChecks >= PowerConfig::CRITICAL_RELAXATION_CHECKS &&
+                  rtcCriticalLastVoltage > 0.0f &&
+                  voltage - rtcCriticalLastVoltage >= PowerConfig::CRITICAL_CHARGE_RISE_V;
+  // Unplausibel (z.B. Akku entfernt), erholt oder wird geladen: normal starten.
+  if (!isPlausibleBatteryVoltage(voltage) || voltage >= PowerConfig::CRITICAL_RESUME_VOLTAGE || charging) {
+    rtcCriticalSleepActive = false;
+    return;
+  }
+
+  rtcCriticalSleepChecks++;
+  rtcCriticalLastVoltage = voltage;
+  startCriticalDeepSleep();
 }
 
 // -----------------------------------------------------------------------------
@@ -1033,6 +1036,8 @@ static void printHelp(Print* out){
     "`heap          - Speicherinfo",
     "`version       - FW-Version",
     "`wlan SSID PW  - WLAN + OTA",
+    "`wlanscan      - WLANs in Reichweite",
+    "`wlanlog       - WLAN-Ereignisse",
     "`otaurl URL    - OTA Manifest-Link",
     "`ota           - OTA starten",
     "`coredump      - letzten Crash anzeigen",
@@ -1153,6 +1158,151 @@ static void setupBLE();
 static void stopMdns();
 
 // -----------------------------------------------------------------------------
+// WLAN-Client: gemeinsamer Verbindungsaufbau + Diagnose
+// -----------------------------------------------------------------------------
+// Kleines Protokoll der STA-Ereignisse seit dem letzten Verbindungsstart.
+// Wird im Arduino-Event-Task geschrieben und per `wlanlog ausgegeben.
+namespace WiFiLog {
+  constexpr size_t ENTRIES = 16;
+  constexpr size_t LINE_LEN = 64;
+  static char lines[ENTRIES][LINE_LEN];
+  static size_t count = 0;
+  static uint32_t startedAt = 0;
+  static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+}
+
+static void wifiLogReset() {
+  portENTER_CRITICAL(&WiFiLog::mux);
+  WiFiLog::count = 0;
+  WiFiLog::startedAt = millis();
+  portEXIT_CRITICAL(&WiFiLog::mux);
+}
+
+static void wifiLogAdd(const char* format, ...) {
+  char line[WiFiLog::LINE_LEN];
+  int prefix = snprintf(line, sizeof(line), "%5.1fs ", (millis() - WiFiLog::startedAt) / 1000.0f);
+  va_list args;
+  va_start(args, format);
+  vsnprintf(line + prefix, sizeof(line) - prefix, format, args);
+  va_end(args);
+  portENTER_CRITICAL(&WiFiLog::mux);
+  // Bei vollem Protokoll den letzten Eintrag ersetzen, damit der Ausgang
+  // eines langen Versuchs sichtbar bleibt.
+  size_t index = WiFiLog::count < WiFiLog::ENTRIES ? WiFiLog::count++ : WiFiLog::ENTRIES - 1;
+  memcpy(WiFiLog::lines[index], line, sizeof(line));
+  portEXIT_CRITICAL(&WiFiLog::mux);
+}
+
+static void onWiFiStationEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED: {
+      const auto& connected = info.wifi_sta_connected;
+      wifiLogAdd("assoziiert %02x:%02x:%02x:%02x:%02x:%02x K%u auth=%u",
+                 connected.bssid[0], connected.bssid[1], connected.bssid[2],
+                 connected.bssid[3], connected.bssid[4], connected.bssid[5],
+                 connected.channel, static_cast<unsigned>(connected.authmode));
+      break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      uint8_t reason = info.wifi_sta_disconnected.reason;
+      if (!reason) reason = WIFI_REASON_UNSPECIFIED;
+      wifiLogAdd("getrennt %u %s rssi=%d", reason,
+                 WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(reason)),
+                 info.wifi_sta_disconnected.rssi);
+      wifiDisconnectCount.fetch_add(1, std::memory_order_relaxed);
+      // ASSOC_LEAVE entsteht nur durch eigenes Trennen (Timeout, Neustart
+      // des Versuchs) und wuerde den eigentlichen Fehler ueberdecken.
+      if (reason != WIFI_REASON_ASSOC_LEAVE) {
+        wifiLastDisconnectReason.store(reason, std::memory_order_relaxed);
+      }
+      break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      wifiLogAdd("IP %s", IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      wifiLogAdd("IP verloren");
+      break;
+    default:
+      break;
+  }
+}
+
+// Kurzer Klartext fuer das 128px-Display.
+static const char* wifiReasonShort(uint8_t reason) {
+  switch (reason) {
+    case WIFI_REASON_NO_AP_FOUND:                     return "SSID nicht gef.";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD: return "Sicherheit inkomp.";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:   return "Signal zu schwach";
+    case WIFI_REASON_AUTH_FAIL:
+    case WIFI_REASON_AUTH_EXPIRE:                     return "Auth fehlgeschl.";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:               return "Passwort falsch?";
+    case WIFI_REASON_ASSOC_FAIL:
+    case WIFI_REASON_ASSOC_EXPIRE:                    return "Assoz. fehlgeschl.";
+    case WIFI_REASON_BEACON_TIMEOUT:                  return "Signal verloren";
+    case WIFI_REASON_CONNECTION_FAIL:                 return "Verbindung fehlg.";
+    default:                                          return "Timeout";
+  }
+}
+
+static String wifiLastErrorText() {
+  uint8_t reason = wifiLastDisconnectReason.load(std::memory_order_relaxed);
+  if (reason == 0) return "kein Fehler vom Router (`wlanlog)";
+  return String(reason) + " " + WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(reason)) +
+         " (" + wifiDisconnectCount.load(std::memory_order_relaxed) + " Trennungen)";
+}
+
+static const char* wifiAuthModeName(wifi_auth_mode_t mode) {
+  switch (mode) {
+    case WIFI_AUTH_OPEN:          return "offen";
+    case WIFI_AUTH_WEP:           return "WEP";
+    case WIFI_AUTH_WPA_PSK:       return "WPA";
+    case WIFI_AUTH_WPA2_PSK:      return "WPA2";
+    case WIFI_AUTH_WPA_WPA2_PSK:  return "WPA/WPA2";
+    case WIFI_AUTH_WPA3_PSK:      return "WPA3";
+    case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2/WPA3";
+    case WIFI_AUTH_OWE:           return "OWE";
+    default:                      return "Enterprise/andere";
+  }
+}
+
+// Startet den STA-Verbindungsaufbau (nicht blockierend). WiFi.mode(WIFI_STA)
+// muss vorher gesetzt sein; der Hostname wird von Arduino nur beim Wechsel in
+// den STA-Modus uebernommen und muss daher davor gesetzt werden.
+static bool beginStationConnection(const String& ssid, const String& password) {
+  // Tri-Band-/Mesh-Router senden dieselbe SSID ueber mehrere BSSIDs: alle
+  // Kanaele scannen und den staerksten Zugangspunkt waehlen.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+  if (WiFi.begin(ssid.c_str(), password.c_str(), 0, nullptr, false) == WL_CONNECT_FAILED) {
+    return false;
+  }
+
+  // Arduino initialisiert die STA-Konfiguration per memset mit 0. Fuer WPA3-SAE
+  // bedeutet das nur "Hunt-and-Peck"; Router, die Hash-to-Element verlangen
+  // (typisch bei WiFi 6E/7 im WPA2/WPA3-Mischbetrieb), lehnen die Anmeldung ab.
+  wifi_config_t conf;
+  if (esp_wifi_get_config(WIFI_IF_STA, &conf) == ESP_OK) {
+    conf.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    conf.sta.failure_retry_cnt = 2;
+    esp_wifi_set_config(WIFI_IF_STA, &conf);
+  }
+  wifiLastDisconnectReason.store(0, std::memory_order_relaxed);
+  wifiDisconnectCount.store(0, std::memory_order_relaxed);
+  wifiLogReset();
+  wifiLogAdd("start SSID=%s", ssid.c_str());
+  return WiFi.STA.connect();
+}
+
+// Haelt der Verbindungsaufbau nach Ablauf der Zeit noch an, den Zustand fuer
+// die Diagnose festhalten (assoziiert ohne IP vs. kein Kontakt zum Router).
+static void wifiLogTimeout() {
+  wifiLogAdd("Abbruch nach Timeout, status=%d", static_cast<int>(WiFi.status()));
+}
+
+// -----------------------------------------------------------------------------
 // HTTP OTA Update (Server-Manifest)
 // -----------------------------------------------------------------------------
 static bool bleWasAdvertising = false;  // Merken ob BLE vorher aktiv war
@@ -1197,15 +1347,18 @@ static bool otaConnectToWiFi() {
   delay(200);
   
   // Station-Modus mit Modem Sleep (WICHTIG für BLE Koexistenz!)
+  WiFi.setHostname(WiFiConfig::MDNS_HOSTNAME);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(WIFI_PS_MIN_MODEM);  // Modem sleep aktivieren
   delay(50);
-  WiFi.begin(ssid.c_str(), pass.c_str());
+  beginStationConnection(ssid, pass);
   
   unsigned long startTime = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - startTime > Timing::OTA_WIFI_TIMEOUT_MS) {
-      display.showMessage("WiFi Fehler", "Timeout", "SSID/Passwort ok?");
+      wifiLogTimeout();
+      uint8_t reason = wifiLastDisconnectReason.load(std::memory_order_relaxed);
+      display.showMessage("WiFi Fehler", reason ? wifiReasonShort(reason) : "Timeout", "SSID/Passwort ok?");
       delay(Timing::MESSAGE_DISPLAY_MS);
       return false;
     }
@@ -1333,26 +1486,28 @@ static void performHTTPOTA() {
     http.end();
   } // <- hier sterben secureClient/basicClient/http -> mbedTLS-Heap frei
   
-  String tagName = extractJsonStringField(payload, "version");
-  if (tagName.length() == 0) {
-    tagName = extractJsonStringField(payload, "tag");
-  }
+  const std::string manifest = toStdString(payload);
+  payload = String();
+  auto manifestField = [&manifest](const char* primary, const char* fallback) {
+    std::string value = ota::extractJsonStringField(manifest, primary);
+    if (value.empty()) value = ota::extractJsonStringField(manifest, fallback);
+    return toArduinoString(value);
+  };
 
-  String firmwareLocation = extractJsonStringField(payload, "firmware");
-  if (firmwareLocation.length() == 0) {
-    firmwareLocation = extractJsonStringField(payload, "url");
-  }
+  String tagName = manifestField("version", "tag");
+  String firmwareLocation = manifestField("firmware", "url");
 
-  String firmwareMd5 = extractJsonStringField(payload, "md5");
+  String firmwareMd5 = toArduinoString(ota::extractJsonStringField(manifest, "md5"));
   firmwareMd5.trim();
-  if (firmwareMd5.length() > 0 && !isValidMD5(firmwareMd5)) {
+  if (firmwareMd5.length() > 0 && !ota::isValidMD5(toStdString(firmwareMd5))) {
     display.showMessage("Update Fehler", "Manifest MD5", "ungueltig");
     delay(4000);
     otaRestoreAP();
     return;
   }
 
-  String downloadUrl = buildAbsoluteUrl(manifestUrl, firmwareLocation);
+  String downloadUrl = toArduinoString(
+      ota::buildAbsoluteUrl(toStdString(manifestUrl), toStdString(firmwareLocation)));
   if (downloadUrl.length() == 0) {
     display.showMessage("Kein Update", "Firmware-Link fehlt", "im Manifest");
     delay(4000);
@@ -1363,51 +1518,20 @@ static void performHTTPOTA() {
   if (tagName.length() == 0) {
     tagName = OTAConfig::FIRMWARE_FILENAME;
   }
-  
-  // Versions-Prüfung: Vergleiche mit aktueller Firmware
-  // Problem: GIT_VERSION wird zur Compile-Zeit gesetzt. Nach OTA enthält die neue
-  // Firmware möglicherweise eine alte Version wenn sie nicht exakt auf dem Tag gebaut wurde.
-  // Lösung: Nach erfolgreichem OTA speichern wir die Tag-Version in NVS.
-  
-  // Prüfe ob wir eine gespeicherte OTA-Version haben (diese hat Vorrang)
-  String installedVersion = prefs.getString("otaVersion", "");
-  String currentVersion = installedVersion.length() > 0 ? installedVersion : String(GIT_VERSION);
 
-  // Normalisiere Versionen (entferne führendes 'v' wenn vorhanden)
-  String remoteVer = tagName;
-  if (remoteVer.startsWith("v") || remoteVer.startsWith("V")) remoteVer = remoteVer.substring(1);
-  String localVer = currentVersion;
-  if (localVer.startsWith("v") || localVer.startsWith("V")) localVer = localVer.substring(1);
-  
-  // Extrahiere Base-Version aus lokalem String (z.B. "1.0.6" aus "1.0.6-2-g1234567")
-  // Format: TAG[-COMMITS-gHASH][-dirty]
-  String localBaseVer = localVer;
-  int dashIdx = localVer.indexOf('-');
-  if (dashIdx > 0) {
-    localBaseVer = localVer.substring(0, dashIdx);
-  }
-
-  // Prüfe ob gleiche Version
-  // - dirty: immer Update erlauben (lokale Änderungen)
-  // - dev/unknown/nur Hash: immer Update erlauben (kein Git Tag)
-  // - Gleiche Base-Version (z.B. 1.0.6 == 1.0.6): bereits aktuell
-  bool isDirty = currentVersion.indexOf("dirty") >= 0;
-  bool isDevBuild = currentVersion == "dev" || currentVersion == "unknown" || currentVersion.length() < 3;
-  // Prüfe ob Version nur ein Commit-Hash ist (keine Punkte = kein semver Tag)
-  bool isHashOnly = localBaseVer.indexOf('.') < 0;
-  bool sameBaseVersion = (remoteVer == localBaseVer);
-  
-  // Nur "bereits aktuell" wenn: exakt gleiche Base-Version UND kein dirty UND kein dev/hash-only Build
-  bool skipUpdate = sameBaseVersion && !isDirty && !isDevBuild && !isHashOnly;
-
-  if (skipUpdate) {
-    display.showMessage("OTA", "Bereits aktuell", tagName.c_str(), 3000);
+  // Die per OTA gespeicherte Tag-Version hat Vorrang, gilt aber nur fuer das
+  // Image, das sie installiert hat (siehe loadInstalledOtaVersion()).
+  String currentVersion = getFirmwareVersion();
+  ota::UpdateDecision decision = ota::decideUpdate(toStdString(currentVersion), toStdString(tagName));
+  if (decision != ota::UpdateDecision::Install) {
+    const char* reason = decision == ota::UpdateDecision::RemoteOlder ? "Server aelter" : "Bereits aktuell";
+    display.showMessage("OTA", reason, tagName.c_str(), 3000);
     delay(3000);
     otaRestoreAP();
     return;
   }
-  
-  display.showMessage("Update:", (tagName + " -> " + currentVersion.substring(0,10)).c_str(), "Lade...");
+
+  display.showMessage("Update:", (currentVersion.substring(0, 10) + " -> " + tagName).c_str(), "Lade...");
   delay(1500);
 
   // Download-Client: identisches Stack-Muster wie beim Manifest, damit
@@ -1526,12 +1650,21 @@ static void performHTTPOTA() {
   }
   
   // Update erfolgreich - Reihenfolge wichtig:
-  //  1) Tag-Version in NVS speichern (fuer kuenftige Versionsvergleiche)
+  //  1) Tag-Version + ELF-SHA des neuen Images in NVS speichern (fuer
+  //     kuenftige Versionsvergleiche, nur gueltig fuer genau dieses Image)
   //  2) Preferences explizit schliessen -> erzwingt NVS-Commit auf Flash
   //  3) Alten Coredump verwerfen: er gehoert zur alten Firmware (andere
   //     ELF-SHA256), Backtraces waeren sonst irrefuehrend.
   //  4) Reboot.
-  prefs.putString("otaVersion", tagName);
+  esp_app_desc_t newAppDesc;
+  const esp_partition_t* newPartition = esp_ota_get_boot_partition();
+  if (newPartition && esp_ota_get_partition_description(newPartition, &newAppDesc) == ESP_OK) {
+    prefs.putString("otaVersion", tagName);
+    prefs.putString("otaElf", appElfShaPrefix(newAppDesc));
+  } else {
+    prefs.remove("otaVersion");
+    prefs.remove("otaElf");
+  }
   prefs.end();
   esp_core_dump_image_erase();
 
@@ -1602,20 +1735,23 @@ static bool startWiFiClient() {
 
   WiFi.mode(WIFI_OFF);
   delay(100);
+  WiFi.setHostname(WiFiConfig::MDNS_HOSTNAME);
   WiFi.mode(WIFI_STA);
   delay(100);
-  WiFi.setHostname(WiFiConfig::MDNS_HOSTNAME);
   WiFi.setSleep(WIFI_PS_MIN_MODEM);
   WiFi.setTxPower(WIFI_POWER_15dBm);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(ssid.c_str(), password.c_str());
+  if (!beginStationConnection(ssid, password)) return false;
 
   uint32_t startedAt = millis();
   while (WiFi.status() != WL_CONNECTED &&
          millis() - startedAt < WiFiConfig::CLIENT_CONNECT_TIMEOUT_MS) {
     delay(100);
   }
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiLogTimeout();
+    return false;
+  }
 
   wifiFallbackAccessPoint = false;
   startMdnsForClient();
@@ -1628,9 +1764,11 @@ static void setupWiFi(){
                    ? startWiFiClient()
                    : startAccessPoint(false);
   if (!started && configuredWiFiMode == WiFiConfig::Mode::Client) {
+    uint8_t reason = wifiLastDisconnectReason.load(std::memory_order_relaxed);
     started = startAccessPoint(true);
     if (started) {
-      display.showMessage("WLAN Fehler", "Hotspot aktiv", WIFI_IP, 3000);
+      display.showMessage("WLAN Fehler", reason ? wifiReasonShort(reason) : "Timeout",
+                          "Hotspot aktiv", 3000);
     }
   }
   if (!started) {
@@ -1703,28 +1841,40 @@ static void printBaudOptions(Print* out){
   bleSend((const uint8_t*)msg.c_str(), msg.length());
 }
 
-static bool isInternalCommand(const String& command) {
+// Entfernt Leerraum und optionale ':'/'::'-Praefixe, behaelt aber die
+// Gross-/Kleinschreibung (SSID, Passwort und URL sind case-sensitiv).
+static String stripCommandPrefix(const String& command) {
   String value = command;
   value.trim();
-  value.toLowerCase();
   while (value.startsWith("::")) value.remove(0, 2);
   if (value.startsWith(":")) value.remove(0, 1);
+  return value;
+}
+
+static String normalizeCommand(const String& command) {
+  String value = stripCommandPrefix(command);
+  value.toLowerCase();
+  return value;
+}
+
+static bool isInternalCommand(const String& command) {
+  String value = normalizeCommand(command);
 
   return value == "usb" || value == "rs232" ||
          value == "echo" || value == "echo on" || value == "echo off" ||
          value == "baud" || value.startsWith("baud ") ||
          value == "pins" || value == "en high" || value == "en low" ||
          value == "loopback" || value == "status" || value == "power" ||
-         value == "heap" || value.startsWith("wlan ") ||
+         value == "heap" || value.startsWith("wlan ") || value == "wlanscan" ||
+         value == "wlanlog" ||
          value.startsWith("otaurl ") || value == "ota" ||
          value == "version" || value == "help" ||
          value == "coredump" || value == "coredump erase";
 }
 
 static void handleInternalCommand(const String& cmd){
-  String s = cmd; s.trim(); s.toLowerCase();
-  while (s.startsWith("::")) s.remove(0,2);
-  if (s.length() && s.charAt(0)==':') s.remove(0,1);
+  const String raw = stripCommandPrefix(cmd);
+  String s = raw; s.toLowerCase();
 
   Print* out = telnetSessionActive ? &telnetOut : nullptr;
   auto sendLine = [&](const String& line){ if(out){ out->print(line); out->print("\r\n"); } bleNotifyLine(line); };
@@ -1743,12 +1893,11 @@ static void handleInternalCommand(const String& cmd){
       uint32_t b = 0;
       if (v >= 1 && v <= (uint32_t)BaudConfig::ALL_RATES_COUNT) {
         b = BaudConfig::ALL_RATES[v-1];
-      } else if (isValidBaud(v)) {
+      } else if (BaudConfig::isValid(v)) {
         b = v;
       }
       if (b) {
-        setBaudRate(b);
-        prefs.putUInt("baudRate", b);  // Speichern in NVS
+        applyTargetBaudRate(b);
         if(out) out->printf("Baud rate set to %lu\r\n", (unsigned long)b);
         bleNotifyLine(String("Baud rate set to ")+b);
       }
@@ -1877,6 +2026,7 @@ static void handleInternalCommand(const String& cmd){
     sendLine(String("WiFi mode: ") + getActiveWiFiModeLabel());
     if (wifiClient) {
       sendLine(String("WLAN: ") + WiFi.SSID() + ", IP=" + WiFi.localIP().toString());
+      sendLine(String("WLAN Signal: ") + WiFi.RSSI() + " dBm, Kanal " + WiFi.channel());
       sendLine(String("Hostname: ") + getWiFiHostname());
     } else if (wifiAP) {
       sendLine(String("WiFi AP: ") + ap_ip.toString() + ", clients=" + String((unsigned)wifiClients));
@@ -1884,8 +2034,9 @@ static void handleInternalCommand(const String& cmd){
       sendLine("WiFi: disconnected");
     }
     sendLine(String("Reset: ") + resetReasonToStr(bootResetReason) + ", wake=" + wakeCauseToStr(bootWakeCause) + ", boot=" + bootCount);
-    sendLine(String("Firmware: ") + FIRMWARE_VERSION);
+    sendLine(String("Firmware: ") + getFirmwareVersion());
     sendLine(String("Gespeichertes WLAN: ") + (otaSSID.length() > 0 ? otaSSID : "(nicht konfiguriert)"));
+    sendLine(String("Letzter WLAN-Fehler: ") + wifiLastErrorText());
     sendLine(String("OTA URL: ") + otaUrl);
   } else if (s == "power") {
     sendLine("=== Power / Boot ===");
@@ -1896,6 +2047,13 @@ static void handleInternalCommand(const String& cmd){
     sendLine(String("Battery raw: ") + String(batteryVoltageRawLast, 2) + " V, valid=" + (batteryMeasurementValid ? "yes" : "no") + ", samples=" + batteryValidSamples);
     sendLine(String("GPIO0/BOOT: ") + (digitalRead(MODE_BUTTON_PIN) ? "HIGH" : "LOW"));
     sendLine(String("MAX3232_EN: ") + (gpio_get_level((gpio_num_t)MAX3232_EN_PIN) ? "HIGH" : "LOW"));
+    uint32_t critSleeps = prefs.getUInt("critSleeps", 0);
+    if (critSleeps > 0) {
+      sendLine(String("Kritischer Akku-Sleep: ") + critSleeps + "x, zuletzt bei " +
+               String(prefs.getFloat("critSleepV", 0.0f), 2) + " V, Kurz-Checks=" + rtcCriticalSleepChecks);
+    } else {
+      sendLine("Kritischer Akku-Sleep: nie");
+    }
   } else if (s == "heap") {
     uint32_t freeNow   = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
     uint32_t total     = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
@@ -1913,9 +2071,49 @@ static void handleInternalCommand(const String& cmd){
     sendLine(buf);
     snprintf(buf, sizeof(buf), "Min free ever=%u KB", (unsigned)(minEver/1024));
     sendLine(buf);
+  } else if (s == "wlanlog") {
+    char lines[WiFiLog::ENTRIES][WiFiLog::LINE_LEN];
+    portENTER_CRITICAL(&WiFiLog::mux);
+    size_t count = WiFiLog::count;
+    memcpy(lines, WiFiLog::lines, sizeof(lines));
+    portEXIT_CRITICAL(&WiFiLog::mux);
+    sendLine("=== WLAN-Protokoll ===");
+    if (count == 0) sendLine("(leer)");
+    for (size_t i = 0; i < count; ++i) sendLine(lines[i]);
+    sendLine("auth: 3=WPA2 6=WPA3 7=WPA2/WPA3");
+    sendLine(String("Letzter Fehler: ") + wifiLastErrorText());
+  } else if (s == "wlanscan") {
+    // Zeigt, ob und wie die eigene SSID auf 2,4 GHz sichtbar ist (ESP32-S3
+    // unterstuetzt kein 5/6 GHz). Im Hotspot-Modus wird STA nur temporaer
+    // aktiviert.
+    String configuredSSID = prefs.getString("otaSSID", "");
+    bool staWasEnabled = (WiFi.getMode() & WIFI_MODE_STA) != 0;
+    sendLine("WLAN-Scan (2,4 GHz)...");
+    esp_task_wdt_reset();
+    int16_t count = WiFi.scanNetworks(false, true);
+    esp_task_wdt_reset();
+    if (count < 0) {
+      sendLine("Scan fehlgeschlagen");
+    } else {
+      sendLine(String(count) + " Netze gefunden");
+      bool configuredFound = false;
+      for (int16_t i = 0; i < count && i < 20; ++i) {
+        String ssid = WiFi.SSID(i);
+        bool isConfigured = configuredSSID.length() > 0 && ssid == configuredSSID;
+        configuredFound = configuredFound || isConfigured;
+        sendLine(String(isConfigured ? "* " : "  ") + (ssid.length() ? ssid : String("(versteckt)")) +
+                 "  Kanal " + WiFi.channel(i) + ", " + WiFi.RSSI(i) + " dBm, " +
+                 wifiAuthModeName(WiFi.encryptionType(i)));
+      }
+      if (configuredSSID.length() > 0 && !configuredFound) {
+        sendLine("Gespeicherte SSID nicht auf 2,4 GHz sichtbar!");
+      }
+    }
+    WiFi.scanDelete();
+    if (!staWasEnabled) WiFi.enableSTA(false);
   } else if (s.startsWith("wlan ")) {
     // 'wlan SSID PASSWORD - WiFi-Credentials für OTA speichern
-    String args = cmd.substring(cmd.indexOf("wlan") + 5);
+    String args = raw.substring(5);  // nach "wlan "
     args.trim();
     int spaceIdx = args.indexOf(' ');
     if (spaceIdx > 0) {
@@ -1932,7 +2130,7 @@ static void handleInternalCommand(const String& cmd){
       bleNotifyLine("Syntax: `wlan SSID PASSWORD");
     }
   } else if (s.startsWith("otaurl ")) {
-    String url = cmd.substring(cmd.indexOf("otaurl") + 7);
+    String url = raw.substring(7);  // nach "otaurl "
     url.trim();
     if (url.length() > 0) {
       prefs.putString("otaUrl", url);
@@ -1950,11 +2148,9 @@ static void handleInternalCommand(const String& cmd){
     delay(100);
     performHTTPOTA();
   } else if (s == "version") {
-    // Verwende OTA-Version aus NVS falls vorhanden, sonst GIT_VERSION
-    String otaVer = prefs.getString("otaVersion", "");
-    String displayVer = otaVer.length() > 0 ? otaVer : String(FIRMWARE_VERSION);
-    String ver = String("Firmware: ") + displayVer;
-    if (otaVer.length() > 0) {
+    // OTA-Version aus NVS nur, wenn sie zum laufenden Image gehoert
+    String ver = String("Firmware: ") + getFirmwareVersion();
+    if (installedOtaVersion.length() > 0) {
       ver += " (OTA)";
     } else {
       ver += String(" (") + GIT_COMMIT + ")";
@@ -2024,12 +2220,6 @@ static void handleInternalCommand(const String& cmd){
 // Setup / Loop
 // -----------------------------------------------------------------------------
 static inline void handleTargetRxByte(char c) {
-  if (isUSBMode) {
-    uint8_t bits = usbHostDataBits();
-    if (bits > 0 && bits < 8) {
-      c = static_cast<char>(static_cast<unsigned char>(c) & 0x7F);
-    }
-  }
   uint8_t value = static_cast<uint8_t>(c);
   if (telnetSessionActive) {
     terminal::enqueueTelnetData(telnetTxBuffer, value);
@@ -2053,11 +2243,17 @@ static void drainTargetRx(size_t maxBytes = Timing::SERIAL_DRAIN_BUDGET) {
       usbHostTask();
       lastUsbTask = now;
     }
+    // Datenbits einmal pro Drain lesen statt pro Byte (Mutex im USB-Host).
+    int rxMask = -1;
     int rb = -1;
     while (processed < maxBytes && terminalOutputsCanAcceptByte() &&
            (rb = usbHostReadByte()) >= 0) {
+      if (rxMask < 0) {
+        uint8_t bits = usbHostDataBits();
+        rxMask = (bits > 0 && bits < 8) ? 0x7F : 0xFF;
+      }
       stat_usb_rx++;
-      handleTargetRxByte((char)rb);
+      handleTargetRxByte(static_cast<char>(rb & rxMask));
       processed++;
     }
   } else {
@@ -2174,6 +2370,8 @@ static void processBleRx(size_t maxBytes = Timing::BLE_RX_PROCESS_BUDGET) {
 }
 
 void setup(){
+  resumeCriticalSleepIfBatteryEmpty();
+
   // Kein Serial.begin(): USB-CDC ist per Build-Flag deaktiviert
   // (ARDUINO_USB_CDC_ON_BOOT=0). Diagnose laeuft ueber BLE/Telnet/Web.
 
@@ -2203,9 +2401,10 @@ void setup(){
   bootWakeCause = esp_sleep_get_wakeup_cause();
   bootCount = prefs.getUInt("bootCount", 0) + 1;
   prefs.putUInt("bootCount", bootCount);
+  loadInstalledOtaVersion();
 
   currentBaudRate = prefs.getUInt("baudRate", BaudConfig::DEFAULT_BAUD);
-  if (!isValidBaud(currentBaudRate)) {
+  if (!BaudConfig::isValid(currentBaudRate)) {
     currentBaudRate = BaudConfig::DEFAULT_BAUD;
     prefs.putUInt("baudRate", currentBaudRate);
   }
@@ -2253,6 +2452,7 @@ void setup(){
 
   // WiFi nach BLE und optionalem USB-Host initialisieren, aber noch vor dem
   // dynamischen UART-RX-Puffer.
+  WiFi.onEvent(onWiFiStationEvent);
   setupWiFi();
 
   // RS232 / UART1 Init: HardwareSerial.begin() in arduino-esp32 3.x /

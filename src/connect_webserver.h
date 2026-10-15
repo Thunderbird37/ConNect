@@ -30,6 +30,9 @@ extern bool isWiFiClientConnected();
 extern bool isWiFiFallbackAccessPoint();
 extern String getWiFiIpAddress();
 extern String getWiFiHostname();
+extern String getConfiguredOTAManifestUrl();
+extern String getFirmwareVersion();
+extern bool applyTargetBaudRate(uint32_t baud);
 
 // Preferences für OTA-Einstellungen
 #include <Preferences.h>

@@ -69,9 +69,11 @@ trap cleanup EXIT
 git tag --annotate "${version}" --message "ConNect ${version}"
 tag_created=true
 
-c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
-    test/terminal_transport_test.cpp -o /tmp/connect-terminal-test
-/tmp/connect-terminal-test
+for test_name in terminal_transport ota_manifest; do
+    c++ -std=c++17 -Wall -Wextra -Werror -Isrc \
+        "test/${test_name}_test.cpp" -o "/tmp/connect-${test_name}-test"
+    "/tmp/connect-${test_name}-test"
+done
 pio run -e esp32-s3
 
 git push origin "refs/tags/${version}"
